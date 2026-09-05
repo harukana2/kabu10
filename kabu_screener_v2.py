@@ -167,7 +167,7 @@ def _print_active_filters():
 
 
 if __name__ == "__main__":
-    if not kc.is_market_open_now():
+    if not kc.is_market_open_now() and 0:
         print("現在は取引時間外のため、スクリーニングをスキップします。")
     else:
         _print_active_filters()
