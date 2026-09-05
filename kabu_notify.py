@@ -53,7 +53,7 @@ def _build_html_body(matched_stocks):
     rows_html = ""
     for row in matched_stocks:
         cells = "".join(
-            f"<td style='padding:4px 8px;border:1px solid #ddd;'>{row[h]}</td>"
+            f"<td style='padding:4px 8px;border:1px solid #ddd;white-space:normal;max-width:320px;'>{row[h]}</td>"
             for h in headers
         )
         rows_html += f"<tr>{cells}</tr>"
@@ -67,7 +67,8 @@ def _build_html_body(matched_stocks):
           {rows_html}
         </table>
         <p style="color:#888;font-size:11px;margin-top:12px;">
-          ※本メールは過去データに基づく統計的な目安であり、
+          ※「評価」欄はRSI・MACD・ボリンジャーバンドを機械的に解釈した参考情報です。
+          本メールは過去データに基づく統計的な目安であり、
           将来の値動きや利益を保証するものではありません（投資は自己責任で）。
         </p>
       </body>
@@ -96,9 +97,9 @@ def send_screening_result_email(matched_stocks):
         print("[kabu_notify] 送信先(EMAIL_TO)が未設定のため、メール送信をスキップします。")
         return False
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     subject_prefix = getattr(cfg, "EMAIL_SUBJECT_PREFIX", "[株スクリーニング]")
-    subject = f"{subject_prefix} {today_str} 該当{len(matched_stocks)}件"
+    subject = f"{subject_prefix} {now_str} 該当{len(matched_stocks)}件"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
