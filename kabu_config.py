@@ -95,7 +95,21 @@ DEBUG = False
 ENABLE_EMAIL_NOTIFY = True
 
 GMAIL_ADDRESS = "harukana20520@gmail.com"          # 例: "your_address@gmail.com"（環境変数優先）
-GMAIL_APP_PASSWORD = "ivfb tjpm btxr rjai"     # Googleの「アプリパスワード」16桁（環境変数優先）
+GMAIL_APP_PASSWORD = "cidp bllx hqvq cmjn"     # Googleの「アプリパスワード」16桁（環境変数優先）
 
 EMAIL_TO = []               # 送信先アドレスのリスト。空ならGMAIL_ADDRESS宛に送る
 EMAIL_SUBJECT_PREFIX = "[株スクリーニング]"
+ENABLE_EMAIL_ON_EMPTY = True   # Falseにすると該当銘柄が0件のときはメールを送らない
+
+# ============================================================
+# 取引時間チェック（10分おき等で実行する際の安全装置）
+# cron/GitHub Actions側の精度に関わらず、ここで指定した時間外は
+# スクリーニング自体をスキップする（無駄なAPI呼び出し・メールを防ぐ）。
+# ※日本の祝日（取引所の休場日）は考慮していない点に注意。
+# ============================================================
+ENABLE_MARKET_HOURS_CHECK = True
+MARKET_TIMEZONE = "Asia/Tokyo"
+MARKET_SESSIONS = [
+    ("09:00", "11:30"),   # 前場
+    ("12:30", "15:00"),   # 後場
+]
