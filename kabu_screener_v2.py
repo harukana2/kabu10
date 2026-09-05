@@ -19,6 +19,16 @@ kabu_screener_v2.py
 上記以外のロジック（スコアリング・期待値推定・バックテスト較正・
 約定しやすさ・近傍補完等）は今回の条件と無関係なため実装していない。
 
+■ 出力項目（メール本文）
+候補として絞り込めた銘柄のみ、以下を表示する。
+  - コード / 銘柄名
+  - 現在値・取得時刻（候補銘柄だけ直近の分足を取得し直した実勢に近い値）
+  - 1単元価格・出来高平均
+  - 評価（RSI・MACD・ボリンジャーバンドから機械的に組み立てた
+    短い所見。数値そのものではなく「どんな地合いか」を文章にしたもの）
+※「評価」はあくまでテクニカル指標の機械的な解釈であり、
+  将来の値動きや利益を保証するものではありません。
+
 ■ 重要な注意
 本スクリーニングはあくまで過去データに基づく統計的な目安であり、
 将来の値動きや利益を保証するものではありません。
@@ -36,11 +46,13 @@ import kabu_notify
 warnings.simplefilter("ignore")
 
 
-def screen_stocks(tickers):
+def screen_stocks(tickers, name_map=None):
     """
     全銘柄の株価データを取得し、指定条件をすべて満たす銘柄を抽出して
     結果のリスト(dict)を返す。
+    name_map: {コード(str): 銘柄名(str)} 。渡さない場合、銘柄名は空欄になる。
     """
+    name_map = name_map or {}
     symbols = [f"{t}.T" for t in tickers]
     data = kc.download_bulk_data(symbols, period=cfg.HIST_PERIOD)
     if data.empty:
@@ -62,20 +74,28 @@ def screen_stocks(tickers):
     cond_indicators = kc.apply_indicator_filters_at(ind, latest)
 
     final_cond = (cond_hard & cond_pattern & cond_indicators).fillna(False)
-    matched_symbols = ind["close"].loc[latest][final_cond].dropna().index
+    matched_symbols = list(ind["close"].loc[latest][final_cond].dropna().index)
 
-    if len(matched_symbols) == 0:
+    if not matched_symbols:
         return []
 
-    results = [_build_candidate_row(symbol, ind, latest) for symbol in matched_symbols]
+    # 候補として絞り込めた銘柄（数が少ない）だけ、直近の分足で
+    # 「現在値」を取得し直す。日足の当日終値には数分〜十数分の
+    # 遅延がありうるため、これでより実勢に近い値にする。
+    latest_quotes = kc.fetch_latest_quotes(matched_symbols)
+
+    results = [
+        _build_candidate_row(symbol, ind, latest, name_map, latest_quotes)
+        for symbol in matched_symbols
+    ]
 
     # 出来高が多い順（約定しやすい順の簡易的な目安）に並べる
     results.sort(key=lambda r: r["出来高平均"] or 0, reverse=True)
     return results
 
 
-def _build_candidate_row(symbol, ind, latest):
-    """1銘柄分の指標一式をまとめた結果行(dict)を組み立てる。"""
+def _build_candidate_row(symbol, ind, latest, name_map, latest_quotes):
+    """1銘柄分の情報をまとめた、メール表示用の結果行(dict)を組み立てる。"""
 
     def _at(key, shift=0, default=None):
         series = ind[key]
@@ -84,23 +104,41 @@ def _build_candidate_row(symbol, ind, latest):
         v = series.loc[latest, symbol]
         return float(v) if pd.notna(v) else default
 
-    price = _at("close")
+    code = symbol.replace(".T", "")
+    daily_close = _at("close")
+
+    quote = latest_quotes.get(symbol)
+    if quote is not None:
+        price = quote["price"]
+        price_time = quote["time"].strftime("%Y-%m-%d %H:%M")
+    else:
+        # 分足の再取得に失敗した場合は、日足の当日終値にフォールバックする
+        price = daily_close
+        price_time = f"{latest.strftime('%Y-%m-%d')}（日足終値・再取得失敗）"
+
+    macd_hist = ind["macd_hist"].loc[latest, symbol]
+    macd_hist_prev = ind["macd_hist"].shift(1).loc[latest, symbol]
+    rsi_val = ind["rsi"].loc[latest, symbol]
+    bb_lower = ind["bb_lower"].loc[latest, symbol]
+    bb_upper = ind["bb_upper"].loc[latest, symbol]
+
+    evaluation = kc.build_evaluation_text(
+        rsi=float(rsi_val) if pd.notna(rsi_val) else None,
+        macd_hist=float(macd_hist) if pd.notna(macd_hist) else None,
+        macd_hist_prev=float(macd_hist_prev) if pd.notna(macd_hist_prev) else None,
+        close=daily_close,
+        bb_lower=float(bb_lower) if pd.notna(bb_lower) else None,
+        bb_upper=float(bb_upper) if pd.notna(bb_upper) else None,
+    )
 
     return {
-        "コード": symbol.replace(".T", ""),
+        "コード": code,
+        "銘柄名": name_map.get(code, ""),
         "現在値": round(price, 1) if price is not None else None,
+        "取得時刻": price_time,
         "1単元価格": round(price * cfg.UNIT_SHARES, 0) if price is not None else None,
         "出来高平均": _safe_int(ind["avg_volume"].loc[latest, symbol]),
-        "中期線(当日)": _safe_round(ind["mid_ma"].loc[latest, symbol], 2),
-        "前々日終値": _safe_round(_at("close", shift=2), 2),
-        "前日始値": _safe_round(_at("open", shift=1), 2),
-        "前日終値": _safe_round(_at("close", shift=1), 2),
-        "当日始値": _safe_round(_at("open"), 2),
-        "当日終値": _safe_round(price, 2),
-        "RSI": _safe_round(ind["rsi"].loc[latest, symbol], 1),
-        "MACDヒストグラム": _safe_round(ind["macd_hist"].loc[latest, symbol], 3),
-        "BB下限": _safe_round(ind["bb_lower"].loc[latest, symbol], 2),
-        "BB上限": _safe_round(ind["bb_upper"].loc[latest, symbol], 2),
+        "評価": evaluation,
     }
 
 
@@ -129,22 +167,29 @@ def _print_active_filters():
 
 
 if __name__ == "__main__":
-    _print_active_filters()
+    if not kc.is_market_open_now():
+        print("現在は取引時間外のため、スクリーニングをスキップします。")
+    else:
+        _print_active_filters()
 
-    all_tickers = kc.get_all_japanese_tickers()
+        ticker_master = kc.get_japanese_ticker_master()
 
-    if all_tickers:
-        matched_stocks = screen_stocks(all_tickers)
+        if not ticker_master.empty:
+            all_tickers = ticker_master["コード"].tolist()
+            name_map = dict(zip(ticker_master["コード"], ticker_master["銘柄名"]))
 
-        print("\n=== スクリーニング結果 ===")
-        if not matched_stocks:
-            print("条件に合致する銘柄は見つかりませんでした。")
-        else:
-            print(f"該当銘柄数: {len(matched_stocks)}件\n")
-            for stock in matched_stocks[:cfg.MAX_WRITE_COUNT]:
-                print(stock)
-            if len(matched_stocks) > cfg.MAX_WRITE_COUNT:
-                print(f"...他 {len(matched_stocks) - cfg.MAX_WRITE_COUNT} 件（表示省略）")
+            matched_stocks = screen_stocks(all_tickers, name_map=name_map)
 
-        if getattr(cfg, "ENABLE_EMAIL_NOTIFY", False):
-            kabu_notify.send_screening_result_email(matched_stocks)
+            print("\n=== スクリーニング結果 ===")
+            if not matched_stocks:
+                print("条件に合致する銘柄は見つかりませんでした。")
+            else:
+                print(f"該当銘柄数: {len(matched_stocks)}件\n")
+                for stock in matched_stocks[:cfg.MAX_WRITE_COUNT]:
+                    print(stock)
+                if len(matched_stocks) > cfg.MAX_WRITE_COUNT:
+                    print(f"...他 {len(matched_stocks) - cfg.MAX_WRITE_COUNT} 件（表示省略）")
+
+            if getattr(cfg, "ENABLE_EMAIL_NOTIFY", False):
+                if matched_stocks or getattr(cfg, "ENABLE_EMAIL_ON_EMPTY", True):
+                    kabu_notify.send_screening_result_email(matched_stocks)
