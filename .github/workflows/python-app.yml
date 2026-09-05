@@ -1,0 +1,21 @@
+name: 株スクリーニング定期実行
+
+on:
+  schedule:
+    # UTC基準。22:30 UTC = JST 翌7:30（平日朝に実行したい場合の例）
+    - cron: '30 22 * * 0-4'
+  workflow_dispatch: {}   # 手動実行もできるようにしておく
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pandas numpy yfinance openpyxl
+      - env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python kabu_screener_v2.py
