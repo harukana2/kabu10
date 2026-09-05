@@ -16,18 +16,28 @@ kabu_screener_v2.py
   - 前日(陰線)の安値がボリンジャーバンド下限に達していたこと
   - 当日のMACDヒストグラムが前日より上昇していること（勢いの再加速）
 
-上記以外のロジック（スコアリング・期待値推定・バックテスト較正・
+■ 残り枠の埋め合わせ（デイトレード候補）
+上記のパターン条件だけで MAX_WRITE_COUNT 件に満たない場合は、
+単元価格上限・出来高下限のハードフィルタ(cfg.MAX_UNIT_PRICE /
+cfg.MIN_AVG_VOLUME)はそのままに、「デイトレード向け（本日中に
+上昇しやすい）」という別の評価基準(kc.apply_daytrade_filter_at)に
+切り替えて残りの枠を埋める。候補が余っている場合は
+kc.compute_daytrade_score_at のスコアが高い順に優先する
+（ON/OFF・閾値は kabu_config.py の DAYTRADE_xxx を参照）。
+
+上記以外のロジック（期待値推定・バックテスト較正・
 約定しやすさ・近傍補完等）は今回の条件と無関係なため実装していない。
 
 ■ 出力項目（メール本文）
 候補として絞り込めた銘柄のみ、以下を表示する。
   - コード / 銘柄名
+  - 選定方式（"パターン合致" or "デイトレード候補"）
   - 現在値・取得時刻（候補銘柄だけ直近の分足を取得し直した実勢に近い値）
   - 1単元価格・出来高平均
   - 評価（RSI・MACD・ボリンジャーバンドから機械的に組み立てた
     短い所見。数値そのものではなく「どんな地合いか」を文章にしたもの）
-※「評価」はあくまでテクニカル指標の機械的な解釈であり、
-  将来の値動きや利益を保証するものではありません。
+※「評価」および「選定方式」はあくまでテクニカル指標の機械的な
+  解釈であり、将来の値動きや利益を保証するものではありません。
 
 ■ 重要な注意
 本スクリーニングはあくまで過去データに基づく統計的な目安であり、
@@ -76,6 +86,30 @@ def screen_stocks(tickers, name_map=None):
     final_cond = (cond_hard & cond_pattern & cond_indicators).fillna(False)
     matched_symbols = list(ind["close"].loc[latest][final_cond].dropna().index)
 
+    # 選定方式を記録（メール表示・並び替え用）
+    method_map = {symbol: "パターン合致" for symbol in matched_symbols}
+
+    # パターン条件だけでは MAX_WRITE_COUNT 件に満たない場合、単元価格・
+    # 出来高のハードフィルタ(cond_hard)はそのままに、「デイトレード向け」
+    # という別の評価基準に切り替えて残りの枠を埋める。
+    remaining = cfg.MAX_WRITE_COUNT - len(matched_symbols)
+    if remaining > 0 and getattr(cfg, "ENABLE_DAYTRADE_FALLBACK", True):
+        cond_daytrade = kc.apply_daytrade_filter_at(ind, latest)
+        cond_fill = (cond_hard & cond_daytrade).fillna(False)
+        already_matched = set(matched_symbols)
+        fill_candidates = [
+            symbol for symbol in ind["close"].loc[latest][cond_fill].dropna().index
+            if symbol not in already_matched
+        ]
+
+        if fill_candidates:
+            score = kc.compute_daytrade_score_at(ind, latest)
+            fill_candidates.sort(key=lambda s: score.get(s, float("-inf")), reverse=True)
+            fill_symbols = fill_candidates[:remaining]
+            for symbol in fill_symbols:
+                method_map[symbol] = "デイトレード候補"
+            matched_symbols = matched_symbols + fill_symbols
+
     if not matched_symbols:
         return []
 
@@ -85,16 +119,17 @@ def screen_stocks(tickers, name_map=None):
     latest_quotes = kc.fetch_latest_quotes(matched_symbols)
 
     results = [
-        _build_candidate_row(symbol, ind, latest, name_map, latest_quotes)
+        _build_candidate_row(symbol, ind, latest, name_map, latest_quotes, method_map)
         for symbol in matched_symbols
     ]
 
-    # 出来高が多い順（約定しやすい順の簡易的な目安）に並べる
-    results.sort(key=lambda r: r["出来高平均"] or 0, reverse=True)
+    # パターン合致を優先し、それぞれのグループ内では出来高が多い順
+    # （約定しやすい順の簡易的な目安）に並べる
+    results.sort(key=lambda r: (r["選定方式"] != "パターン合致", -(r["出来高平均"] or 0)))
     return results
 
 
-def _build_candidate_row(symbol, ind, latest, name_map, latest_quotes):
+def _build_candidate_row(symbol, ind, latest, name_map, latest_quotes, method_map=None):
     """1銘柄分の情報をまとめた、メール表示用の結果行(dict)を組み立てる。"""
 
     def _at(key, shift=0, default=None):
@@ -131,9 +166,12 @@ def _build_candidate_row(symbol, ind, latest, name_map, latest_quotes):
         bb_upper=float(bb_upper) if pd.notna(bb_upper) else None,
     )
 
+    method_map = method_map or {}
+
     return {
         "コード": code,
         "銘柄名": name_map.get(code, ""),
+        "選定方式": method_map.get(symbol, "パターン合致"),
         "現在値": round(price, 1) if price is not None else None,
         "取得時刻": price_time,
         "1単元価格": round(price * cfg.UNIT_SHARES, 0) if price is not None else None,
@@ -163,6 +201,19 @@ def _print_active_filters():
           + (" (前日安値がBB下限以下)" if cfg.ENABLE_BB_FILTER and cfg.BB_REQUIRE_PREV_LOW_TOUCH_LOWER else ""))
     print(f"  MACDフィルタ        : {'ON' if cfg.ENABLE_MACD_FILTER else 'OFF'}"
           + (" (ヒストグラムが前日より上昇)" if cfg.ENABLE_MACD_FILTER and cfg.MACD_REQUIRE_HIST_RISING else ""))
+
+    daytrade_on = getattr(cfg, "ENABLE_DAYTRADE_FALLBACK", True)
+    print(f"  デイトレード埋め合わせ: {'ON' if daytrade_on else 'OFF'}"
+          f"（最大{cfg.MAX_WRITE_COUNT}件に満たない分をこの基準で補充）")
+    if daytrade_on:
+        print(f"    条件: 陽線={cfg.DAYTRADE_REQUIRE_BULLISH} / "
+              f"中期線上={cfg.DAYTRADE_REQUIRE_ABOVE_MID_MA} / "
+              f"短期線({cfg.DAYTRADE_SHORT_MA_WINDOW}日)上向き={cfg.DAYTRADE_REQUIRE_SHORT_MA_RISING} / "
+              f"出来高比{cfg.DAYTRADE_VOLUME_RATIO_MIN}倍以上 / "
+              f"引け位置{cfg.DAYTRADE_CLOSE_POSITION_MIN}以上 / "
+              f"RSI{cfg.DAYTRADE_RSI_MIN}〜{cfg.DAYTRADE_RSI_MAX} / "
+              f"MACD上昇={cfg.DAYTRADE_REQUIRE_MACD_HIST_RISING}"
+              "（単元価格・出来高のハードフィルタは上記と共通）")
     print()
 
 
