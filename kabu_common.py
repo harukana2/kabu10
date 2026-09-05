@@ -326,6 +326,7 @@ def compute_all_indicators(closes, opens, highs, lows, volumes):
     （前日・前々日の値を参照するため）。
     """
     mid_ma = closes.rolling(window=cfg.MID_TERM_MA_WINDOW).mean()
+    short_ma = closes.rolling(window=getattr(cfg, "DAYTRADE_SHORT_MA_WINDOW", 5)).mean()
     avg_volume = volumes.rolling(window=cfg.VOLUME_MA_WINDOW).mean()
 
     rsi = calc_rsi(closes)
@@ -334,7 +335,7 @@ def compute_all_indicators(closes, opens, highs, lows, volumes):
 
     return {
         "close": closes, "open": opens, "high": highs, "low": lows, "volume": volumes,
-        "mid_ma": mid_ma, "avg_volume": avg_volume,
+        "mid_ma": mid_ma, "short_ma": short_ma, "avg_volume": avg_volume,
         "rsi": rsi, "macd": macd, "macd_signal": macd_signal, "macd_hist": macd_hist,
         "bb_mid": bb_mid, "bb_upper": bb_upper, "bb_lower": bb_lower,
     }
@@ -440,3 +441,110 @@ def apply_indicator_filters_at(ind, date_idx):
         cond &= (hist_0 > hist_1)
 
     return cond.fillna(False)
+
+
+# ============================================================
+# 残り枠の埋め合わせ（デイトレード候補）判定
+# ------------------------------------------------------------
+# ローソク足パターン条件（apply_pattern_filter_at）に合致しなかった
+# 銘柄の中から、「本日中に上昇しやすいデイトレード向け」という
+# 別の評価基準で残りの枠を埋めるために使う。
+# 単元価格上限・出来高下限のハードフィルタ(apply_hard_filter_at)は
+# 呼び出し側で従来通り別途適用する前提（このフィルタでは変更しない）。
+#
+# ここでの判定・スコアはあくまで日足データから見た機械的な目安であり、
+# 実際に本日中に上昇することを保証するものではない。
+# ============================================================
+
+def apply_daytrade_filter_at(ind, date_idx):
+    """
+    デイトレード候補として最低限満たすべき条件を判定する。
+    各条件は kabu_config.py の DAYTRADE_xxx で ON/OFF・閾値を調整できる。
+    """
+    close = ind["close"].loc[date_idx]
+    open_ = ind["open"].loc[date_idx]
+    high = ind["high"].loc[date_idx]
+    low = ind["low"].loc[date_idx]
+    volume = ind["volume"].loc[date_idx]
+    avg_volume = ind["avg_volume"].loc[date_idx]
+    mid_ma = ind["mid_ma"].loc[date_idx]
+    short_ma_0 = ind["short_ma"].loc[date_idx]
+    short_ma_1 = ind["short_ma"].shift(1).loc[date_idx]
+    rsi = ind["rsi"].loc[date_idx]
+    macd_hist_0 = ind["macd_hist"].loc[date_idx]
+    macd_hist_1 = ind["macd_hist"].shift(1).loc[date_idx]
+
+    cond = pd.Series(True, index=close.index)
+
+    if getattr(cfg, "DAYTRADE_REQUIRE_BULLISH", True):
+        cond &= (close > open_)
+
+    if getattr(cfg, "DAYTRADE_REQUIRE_ABOVE_MID_MA", True):
+        cond &= (close > mid_ma)
+
+    if getattr(cfg, "DAYTRADE_REQUIRE_SHORT_MA_RISING", True):
+        cond &= (short_ma_0 > short_ma_1)
+
+    volume_ratio = volume / avg_volume.replace(0, np.nan)
+    cond &= (volume_ratio >= getattr(cfg, "DAYTRADE_VOLUME_RATIO_MIN", 1.2))
+
+    day_range = (high - low).replace(0, np.nan)
+    close_position = (close - low) / day_range
+    cond &= (close_position >= getattr(cfg, "DAYTRADE_CLOSE_POSITION_MIN", 0.6))
+
+    cond &= (rsi >= getattr(cfg, "DAYTRADE_RSI_MIN", 50.0)) & \
+            (rsi <= getattr(cfg, "DAYTRADE_RSI_MAX", 75.0))
+
+    if getattr(cfg, "DAYTRADE_REQUIRE_MACD_HIST_RISING", True):
+        cond &= (macd_hist_0 > macd_hist_1)
+
+    return cond.fillna(False)
+
+
+def compute_daytrade_score_at(ind, date_idx):
+    """
+    デイトレード候補同士を比較するための勢いスコアを算出する。
+    値が大きいほど「本日中に上昇する勢いが強い」とみなす目安（機械的な heuristic）。
+    apply_daytrade_filter_at() を通過した候補が埋め合わせ枠より多い場合に、
+    スコアの高い順に優先して選ぶために使う。
+
+    重みは固定値の目安であり、運用しながら調整して構わない。
+    """
+    close = ind["close"].loc[date_idx]
+    open_ = ind["open"].loc[date_idx]
+    high = ind["high"].loc[date_idx]
+    low = ind["low"].loc[date_idx]
+    volume = ind["volume"].loc[date_idx]
+    avg_volume = ind["avg_volume"].loc[date_idx]
+    rsi = ind["rsi"].loc[date_idx]
+    macd_hist_0 = ind["macd_hist"].loc[date_idx]
+    macd_hist_1 = ind["macd_hist"].shift(1).loc[date_idx]
+
+    # 出来高急増度合い（上限5倍でクリップし、極端な値に引っ張られすぎないようにする）
+    volume_ratio = (volume / avg_volume.replace(0, np.nan)).clip(upper=5.0)
+
+    # 当日の値幅の中で、どれだけ高値圏で引けたか（1に近いほど買い優勢）
+    day_range = (high - low).replace(0, np.nan)
+    close_position = (close - low) / day_range
+
+    # 当日の陽線の実体の大きさ（始値に対する上昇率）
+    gain_pct = (close - open_) / open_.replace(0, np.nan)
+
+    # RSIはDAYTRADE_RSI_MIN〜MAXの中央付近を最も高く評価する山型スコアにする
+    rsi_min = getattr(cfg, "DAYTRADE_RSI_MIN", 50.0)
+    rsi_max = getattr(cfg, "DAYTRADE_RSI_MAX", 75.0)
+    rsi_center = (rsi_min + rsi_max) / 2
+    rsi_half_width = max((rsi_max - rsi_min) / 2, 1e-9)
+    rsi_score = 1 - ((rsi - rsi_center).abs() / rsi_half_width).clip(lower=0, upper=1)
+
+    # MACDヒストグラムの加速度（前日からどれだけ上向きに変化したか）
+    macd_accel = (macd_hist_0 - macd_hist_1).clip(lower=-1, upper=1)
+
+    score = (
+        volume_ratio.fillna(0) * 1.0
+        + close_position.fillna(0) * 2.0
+        + gain_pct.fillna(0) * 10.0
+        + rsi_score.fillna(0) * 1.0
+        + macd_accel.fillna(0) * 1.0
+    )
+    return score
