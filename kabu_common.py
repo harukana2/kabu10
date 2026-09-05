@@ -14,6 +14,9 @@ RSI・ボリンジャーバンド・MACDの3指標のみを扱う。
 
 import math
 import time
+from datetime import datetime
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -25,6 +28,39 @@ try:
     HAS_YFINANCE = True
 except ImportError:
     HAS_YFINANCE = False
+
+
+# ============================================================
+# 取引時間チェック
+# ============================================================
+
+def is_market_open_now():
+    """
+    現在時刻が取引時間内かどうかを判定する。
+    kabu_config.ENABLE_MARKET_HOURS_CHECK が False の場合は常に True を返す
+    （＝チェックせず常に実行する）。
+
+    ※日本の祝日（取引所の休場日）はカレンダーで判定していないため、
+      祝日も「平日」として True になる点に注意。
+      正確に判定したい場合は `pip install jpholiday` の上、
+      この関数内で jpholiday.is_holiday(now.date()) を追加でチェックすること。
+    """
+    if not getattr(cfg, "ENABLE_MARKET_HOURS_CHECK", True):
+        return True
+
+    tz = ZoneInfo(getattr(cfg, "MARKET_TIMEZONE", "Asia/Tokyo"))
+    now = datetime.now(tz)
+
+    if now.weekday() >= 5:  # 5=土, 6=日
+        return False
+
+    now_t = now.time()
+    for start_str, end_str in getattr(cfg, "MARKET_SESSIONS", []):
+        start_t = dtime.fromisoformat(start_str)
+        end_t = dtime.fromisoformat(end_str)
+        if start_t <= now_t <= end_t:
+            return True
+    return False
 
 
 # ============================================================
@@ -77,21 +113,153 @@ def download_bulk_data(symbols, period, interval="1d", chunk_size=cfg.CHUNK_SIZE
     return pd.concat(frames, axis=1)
 
 
-def get_all_japanese_tickers():
-    """JPXから全上場銘柄のリストを取得する（プライム/スタンダード/グロース）"""
+def get_japanese_ticker_master():
+    """
+    JPXから全上場銘柄の一覧（プライム/スタンダード/グロース）を、
+    コードと銘柄名の対応がわかる形で取得する。
+    戻り値: DataFrame（列: "コード", "銘柄名"）
+    """
     print("JPXから全銘柄リストを取得中...")
     try:
         df = pd.read_excel(cfg.JPX_LIST_URL)
         df = df[df["市場・商品区分"].str.contains(cfg.TARGET_MARKETS_REGEX, na=False)]
-        tickers = df["コード"].astype(str).tolist()
-        print(f"  対象銘柄数: {len(tickers)}")
-        return tickers
+        df = df[["コード", "銘柄名"]].copy()
+        df["コード"] = df["コード"].astype(str)
+        print(f"  対象銘柄数: {len(df)}")
+        return df
     except Exception as e:
         print(f"銘柄リストの取得に失敗しました: {e}")
-        return []
+        return pd.DataFrame(columns=["コード", "銘柄名"])
 
 
-def parse_ticker_code(code_val):
+def get_all_japanese_tickers():
+    """
+    JPXから全上場銘柄のコードのみを取得する（従来互換用）。
+    銘柄名も併せて使いたい場合は get_japanese_ticker_master() を使うこと。
+    """
+    return get_japanese_ticker_master()["コード"].tolist()
+
+
+def fetch_latest_quotes(symbols, verbose=True):
+    """
+    指定銘柄について、直近の分足データから実勢に近い「現在値」を取得し直す。
+
+    ■ なぜ必要か
+    screen_stocks() で使っている日足データ(period=cfg.HIST_PERIOD, interval="1d")の
+    「当日」の終値は、取引時間中は「その時点までの最新値」を反映するものの、
+    Yahoo Finance側の更新間隔・遅延（無料データは十数分程度遅れることがある）の
+    影響を受ける。10分おきなど短い間隔で実行する場合は、
+    候補として絞り込んだ銘柄（数が少ない）だけ改めて1分足を取得し直すことで、
+    より実勢に近い「現在値」を得られるようにしている。
+
+    戻り値: dict[symbol] = {"price": float, "time": pd.Timestamp}
+            取得できなかった銘柄はキーに含まれない（呼び出し側で日足の値に
+            フォールバックすること）。
+    """
+    if not symbols or not HAS_YFINANCE:
+        return {}
+
+    symbols = list(symbols)
+    try:
+        d = yf.download(
+            symbols, period="1d", interval="1m", progress=False,
+            group_by="column", auto_adjust=False, threads=True,
+        )
+    except Exception as e:
+        if verbose:
+            print(f"[fetch_latest_quotes] 直近値の再取得に失敗しました: {e}")
+        return {}
+
+    if d is None or d.empty:
+        return {}
+
+    d = _normalize_columns(d, symbols)
+    if "Close" not in d.columns.get_level_values(0):
+        return {}
+    closes = d["Close"]
+
+    quotes = {}
+    for symbol in symbols:
+        if symbol not in closes.columns:
+            continue
+        series = closes[symbol].dropna()
+        if series.empty:
+            continue
+        quotes[symbol] = {"price": float(series.iloc[-1]), "time": series.index[-1]}
+    return quotes
+
+
+# ============================================================
+# テクニカル指標からの簡易評価コメント
+# ------------------------------------------------------------
+# RSI・MACDヒストグラム・ボリンジャーバンドの「値そのもの」は
+# 見てもわかりにくいため、メールには数値の代わりに
+# 「どんな地合いか」を簡潔な文章にして載せる。
+# あくまで機械的なテクニカル指標の解釈であり、将来の値動きを
+# 保証するものではない点に注意。
+# ============================================================
+
+def build_evaluation_text(rsi, macd_hist, macd_hist_prev, close, bb_lower, bb_upper):
+    """
+    RSI・MACDヒストグラム・ボリンジャーバンドの値から、
+    人が読んで意味がわかる短い評価コメントを組み立てる。
+    値がNoneの指標はスキップする（RSI/BB/MACDフィルタOFFでも計算自体はしているため
+    値そのものは通常揃っている）。
+    """
+    parts = []
+    bull_score = 0
+    bear_score = 0
+
+    # --- RSI: 過熱感・売られすぎ感 ---
+    if rsi is not None:
+        if rsi >= 70:
+            parts.append(f"RSI{rsi:.0f}で過熱気味（買われすぎ水準、伸び悩みに注意）")
+            bear_score += 1
+        elif rsi <= 30:
+            parts.append(f"RSI{rsi:.0f}で売られすぎ水準（反発が入りやすい局面）")
+            bull_score += 1
+        else:
+            parts.append(f"RSI{rsi:.0f}で中立圏")
+
+    # --- MACDヒストグラム: 勢いの方向 ---
+    if macd_hist is not None and macd_hist_prev is not None:
+        rising = macd_hist > macd_hist_prev
+        positive = macd_hist > 0
+        if rising and positive:
+            parts.append("MACDは上昇の勢いが強まっている")
+            bull_score += 1
+        elif rising and not positive:
+            parts.append("MACDはマイナス圏だが下落の勢いは弱まりつつある")
+            bull_score += 1
+        elif (not rising) and positive:
+            parts.append("MACDはプラス圏だが勢いはやや鈍化")
+        else:
+            parts.append("MACDは下落の勢いが継続")
+            bear_score += 1
+
+    # --- ボリンジャーバンド: バンド内での位置 ---
+    if bb_lower is not None and bb_upper is not None and close is not None:
+        band_width = bb_upper - bb_lower
+        if band_width and band_width > 0:
+            position = (close - bb_lower) / band_width
+            if position <= 0.15:
+                parts.append("株価はBB下限付近（下げ過ぎの可能性）")
+                bull_score += 1
+            elif position >= 0.85:
+                parts.append("株価はBB上限付近（過熱気味の可能性）")
+                bear_score += 1
+
+    if not parts:
+        return "評価情報なし"
+
+    if bull_score - bear_score >= 2:
+        summary = "強気材料が優勢"
+    elif bear_score - bull_score >= 2:
+        summary = "弱気材料が優勢（過熱・伸び悩みに注意）"
+    else:
+        summary = "強気・弱気材料が拮抗（判断材料としては中立）"
+
+    return f"{summary}／" + " ／ ".join(parts)
     """銘柄コードの整形（末尾の '.0' '.T' 等を除去）"""
     if pd.isna(code_val):
         return None
