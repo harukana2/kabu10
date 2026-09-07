@@ -140,8 +140,8 @@ VALUE_MAX_PER = 8.0                     # PER上限
 VALUE_MAX_PBR = 0.8                     # PBR上限
 VALUE_MIN_NET_CASH_RATIO = 0.9          # (流動資産-負債)/時価総額 の下限
 
-VALUE_FUNDAMENTALS_MAX_UNIVERSE = 300   # ファンダメンタルズ取得対象の上限銘柄数（多すぎると時間がかかるため）
-VALUE_FUNDAMENTALS_MAX_WORKERS = 10     # ファンダメンタルズ取得の並列数
+VALUE_FUNDAMENTALS_MAX_UNIVERSE = 3000   # ファンダメンタルズ取得対象の上限銘柄数（多すぎると時間がかかるため）
+VALUE_FUNDAMENTALS_MAX_WORKERS = 20     # ファンダメンタルズ取得の並列数
 VALUE_FUNDAMENTALS_SLEEP_SEC = 0.0      # 各取得後のウェイト秒数（レート制限が気になる場合に設定）
 
 # ============================================================
