@@ -12,6 +12,7 @@ RSI・ボリンジャーバンド・MACDの3指標のみを扱う。
 ------------------------------------------------------------
 """
 
+import concurrent.futures
 import math
 import time
 from datetime import datetime
@@ -548,3 +549,161 @@ def compute_daytrade_score_at(ind, date_idx):
         + macd_accel.fillna(0) * 1.0
     )
     return score
+
+
+# ============================================================
+# さらに残り枠の埋め合わせ（バリュー株候補）判定
+# ------------------------------------------------------------
+# パターン合致・デイトレード埋め合わせでも MAX_WRITE_COUNT 件に
+# 満たない場合の最後の埋め合わせ基準。
+# 日足の一括ダウンロードと違い、時価総額・PER・PBR・流動資産・負債は
+# yfinanceでは銘柄ごとに個別取得する必要があるため、専用の関数群に分けた。
+# ============================================================
+
+_BALANCE_SHEET_CURRENT_ASSETS_KEYS = ("Total Current Assets", "Current Assets")
+_BALANCE_SHEET_LIABILITIES_KEYS = (
+    "Total Liabilities Net Minority Interest", "Total Liab", "Total Liabilities",
+)
+
+
+def _fetch_single_fundamentals(symbol):
+    """
+    1銘柄分のファンダメンタルズ（時価総額・PER・PBR・流動資産・負債）を
+    yfinanceから取得する。いずれかが取得できない場合はNoneを返す
+    （＝バリュー株候補の判定対象から除外される）。
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info or {}
+        market_cap = info.get("marketCap")
+        per = info.get("trailingPE")
+        pbr = info.get("priceToBook")
+
+        current_assets = None
+        total_liabilities = None
+        bs = ticker.balance_sheet
+        if bs is not None and not bs.empty:
+            latest_col = bs.columns[0]
+            for key in _BALANCE_SHEET_CURRENT_ASSETS_KEYS:
+                if key in bs.index:
+                    current_assets = bs.loc[key, latest_col]
+                    break
+            for key in _BALANCE_SHEET_LIABILITIES_KEYS:
+                if key in bs.index:
+                    total_liabilities = bs.loc[key, latest_col]
+                    break
+
+        if None in (market_cap, per, pbr, current_assets, total_liabilities):
+            return None
+        if pd.isna(market_cap) or pd.isna(per) or pd.isna(pbr) or \
+                pd.isna(current_assets) or pd.isna(total_liabilities):
+            return None
+
+        market_cap = float(market_cap)
+        if market_cap == 0:
+            return None
+
+        net_cash_ratio = (float(current_assets) - float(total_liabilities)) / market_cap
+
+        return {
+            "market_cap": market_cap,
+            "per": float(per),
+            "pbr": float(pbr),
+            "current_assets": float(current_assets),
+            "total_liabilities": float(total_liabilities),
+            "net_cash_ratio": net_cash_ratio,
+        }
+    except Exception:
+        return None
+
+
+def fetch_value_fundamentals(symbols, max_workers=None, sleep_sec=None, verbose=True):
+    """
+    指定銘柄について、バリュー株判定に必要なファンダメンタルズ
+    （時価総額・PER・PBR・流動資産・負債・ネットキャッシュ比率）を
+    並列取得する。
+
+    ※ yfinanceでは日足の一括ダウンロードと異なり、この情報は銘柄ごとに
+      個別リクエストが必要になる。対象銘柄数が多いと時間がかかり、
+      レート制限に当たる可能性もあるため、呼び出し側で対象銘柄数を
+      絞ってから渡すこと（kabu_config.VALUE_FUNDAMENTALS_MAX_UNIVERSE）。
+
+    戻り値: dict[symbol] = {"market_cap", "per", "pbr",
+                             "current_assets", "total_liabilities",
+                             "net_cash_ratio"}
+            取得・計算に失敗した銘柄はキーに含まれない。
+    """
+    if not symbols or not HAS_YFINANCE:
+        return {}
+
+    max_workers = max_workers or getattr(cfg, "VALUE_FUNDAMENTALS_MAX_WORKERS", 10)
+    sleep_sec = sleep_sec if sleep_sec is not None else getattr(cfg, "VALUE_FUNDAMENTALS_SLEEP_SEC", 0.0)
+
+    total = len(symbols)
+    if verbose:
+        print(f"{total} 銘柄のファンダメンタルズ（時価総額・PER・PBR・流動資産・負債）を取得中... "
+              f"（銘柄ごとの個別取得のため時間がかかります）")
+
+    def _worker(symbol):
+        result = _fetch_single_fundamentals(symbol)
+        if sleep_sec:
+            time.sleep(sleep_sec)
+        return symbol, result
+
+    results = {}
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_worker, symbol) for symbol in symbols]
+        for future in concurrent.futures.as_completed(futures):
+            symbol, result = future.result()
+            done += 1
+            if result is not None:
+                results[symbol] = result
+            if verbose and done % 50 == 0:
+                print(f"  {done}/{total} 件処理済み...")
+
+    if verbose:
+        print(f"  ファンダメンタルズ取得完了: {len(results)}/{total} 件成功")
+    return results
+
+
+def apply_value_filter(fundamentals):
+    """
+    fetch_value_fundamentals() で取得したファンダメンタルズ dict のうち、
+    バリュー株条件（すべて満たすこと）を通過した銘柄コードのリストを返す。
+      - 時価総額 < cfg.VALUE_MAX_MARKET_CAP
+      - 0 < PER  < cfg.VALUE_MAX_PER
+      - 0 < PBR  < cfg.VALUE_MAX_PBR
+      - ネットキャッシュ比率 (流動資産-負債)/時価総額 > cfg.VALUE_MIN_NET_CASH_RATIO
+    """
+    max_cap = getattr(cfg, "VALUE_MAX_MARKET_CAP", 50_000_000_000)
+    max_per = getattr(cfg, "VALUE_MAX_PER", 8.0)
+    max_pbr = getattr(cfg, "VALUE_MAX_PBR", 0.8)
+    min_ncr = getattr(cfg, "VALUE_MIN_NET_CASH_RATIO", 0.9)
+
+    matched = []
+    for symbol, f in fundamentals.items():
+        if f["market_cap"] >= max_cap:
+            continue
+        if not (0 < f["per"] < max_per):
+            continue
+        if not (0 < f["pbr"] < max_pbr):
+            continue
+        if not (f["net_cash_ratio"] > min_ncr):
+            continue
+        matched.append(symbol)
+    return matched
+
+
+def build_value_evaluation_text(market_cap, per, pbr, net_cash_ratio):
+    """
+    バリュー株候補の評価コメントを組み立てる（メール表示用）。
+    数値そのものではなく、機械的な解釈を短い文章にしたもの。
+    """
+    market_cap_oku = market_cap / 1e8  # 億円換算
+    return (
+        f"時価総額{market_cap_oku:,.0f}億円 ／ PER{per:.1f}倍 ／ PBR{pbr:.2f}倍 ／ "
+        f"ネットキャッシュ比率{net_cash_ratio:.2f}倍"
+        "（保有する流動資産だけで時価総額の大半〜それ以上を賄える計算で、"
+        "理論上は割安・財務的に安全性が高いとされる水準）"
+    )
