@@ -110,6 +110,41 @@ def screen_stocks(tickers, name_map=None):
                 method_map[symbol] = "デイトレード候補"
             matched_symbols = matched_symbols + fill_symbols
 
+    # パターン合致 + デイトレード埋め合わせ でも MAX_WRITE_COUNT 件に満たない場合、
+    # 単元価格・出来高のハードフィルタ(cond_hard)はそのままに、「割安なバリュー株
+    # （時価総額小・低PER・低PBR・ネットキャッシュ比率高）」という基準に切り替えて
+    # 残りの枠を埋める。
+    fundamentals_map = {}
+    remaining = cfg.MAX_WRITE_COUNT - len(matched_symbols)
+    if remaining > 0 and getattr(cfg, "ENABLE_VALUE_FALLBACK", True):
+        already_matched = set(matched_symbols)
+        value_universe = [
+            symbol for symbol in ind["close"].loc[latest][cond_hard].dropna().index
+            if symbol not in already_matched
+        ]
+
+        max_universe = getattr(cfg, "VALUE_FUNDAMENTALS_MAX_UNIVERSE", 300)
+        if max_universe and len(value_universe) > max_universe:
+            # ファンダメンタルズは銘柄ごとの個別取得が必要で時間がかかるため、
+            # 対象が多すぎる場合は出来高平均が多い（データが安定している）
+            # 銘柄から優先的にチェックする。
+            avg_volume_now = ind["avg_volume"].loc[latest]
+            value_universe = sorted(
+                value_universe, key=lambda s: avg_volume_now.get(s, 0), reverse=True
+            )[:max_universe]
+
+        if value_universe:
+            fundamentals = kc.fetch_value_fundamentals(value_universe)
+            value_candidates = kc.apply_value_filter(fundamentals)
+            value_candidates = [s for s in value_candidates if s not in already_matched]
+            # ネットキャッシュ比率が高い順（より割安・財務的に安全性が高い順）に優先
+            value_candidates.sort(key=lambda s: fundamentals[s]["net_cash_ratio"], reverse=True)
+            value_symbols = value_candidates[:remaining]
+            for symbol in value_symbols:
+                method_map[symbol] = "バリュー株候補"
+            fundamentals_map.update({s: fundamentals[s] for s in value_symbols})
+            matched_symbols = matched_symbols + value_symbols
+
     if not matched_symbols:
         return []
 
@@ -119,17 +154,18 @@ def screen_stocks(tickers, name_map=None):
     latest_quotes = kc.fetch_latest_quotes(matched_symbols)
 
     results = [
-        _build_candidate_row(symbol, ind, latest, name_map, latest_quotes, method_map)
+        _build_candidate_row(symbol, ind, latest, name_map, latest_quotes, method_map, fundamentals_map)
         for symbol in matched_symbols
     ]
 
-    # パターン合致を優先し、それぞれのグループ内では出来高が多い順
-    # （約定しやすい順の簡易的な目安）に並べる
-    results.sort(key=lambda r: (r["選定方式"] != "パターン合致", -(r["出来高平均"] or 0)))
+    # パターン合致 → デイトレード候補 → バリュー株候補 の順を優先し、
+    # それぞれのグループ内では出来高が多い順（約定しやすい順の簡易的な目安）に並べる
+    method_order = {"パターン合致": 0, "デイトレード候補": 1, "バリュー株候補": 2}
+    results.sort(key=lambda r: (method_order.get(r["選定方式"], 99), -(r["出来高平均"] or 0)))
     return results
 
 
-def _build_candidate_row(symbol, ind, latest, name_map, latest_quotes, method_map=None):
+def _build_candidate_row(symbol, ind, latest, name_map, latest_quotes, method_map=None, fundamentals_map=None):
     """1銘柄分の情報をまとめた、メール表示用の結果行(dict)を組み立てる。"""
 
     def _at(key, shift=0, default=None):
@@ -151,27 +187,36 @@ def _build_candidate_row(symbol, ind, latest, name_map, latest_quotes, method_ma
         price = daily_close
         price_time = f"{latest.strftime('%Y-%m-%d')}（日足終値・再取得失敗）"
 
-    macd_hist = ind["macd_hist"].loc[latest, symbol]
-    macd_hist_prev = ind["macd_hist"].shift(1).loc[latest, symbol]
-    rsi_val = ind["rsi"].loc[latest, symbol]
-    bb_lower = ind["bb_lower"].loc[latest, symbol]
-    bb_upper = ind["bb_upper"].loc[latest, symbol]
-
-    evaluation = kc.build_evaluation_text(
-        rsi=float(rsi_val) if pd.notna(rsi_val) else None,
-        macd_hist=float(macd_hist) if pd.notna(macd_hist) else None,
-        macd_hist_prev=float(macd_hist_prev) if pd.notna(macd_hist_prev) else None,
-        close=daily_close,
-        bb_lower=float(bb_lower) if pd.notna(bb_lower) else None,
-        bb_upper=float(bb_upper) if pd.notna(bb_upper) else None,
-    )
-
     method_map = method_map or {}
+    fundamentals_map = fundamentals_map or {}
+    method = method_map.get(symbol, "パターン合致")
+
+    if method == "バリュー株候補" and symbol in fundamentals_map:
+        f = fundamentals_map[symbol]
+        evaluation = kc.build_value_evaluation_text(
+            market_cap=f["market_cap"], per=f["per"], pbr=f["pbr"],
+            net_cash_ratio=f["net_cash_ratio"],
+        )
+    else:
+        macd_hist = ind["macd_hist"].loc[latest, symbol]
+        macd_hist_prev = ind["macd_hist"].shift(1).loc[latest, symbol]
+        rsi_val = ind["rsi"].loc[latest, symbol]
+        bb_lower = ind["bb_lower"].loc[latest, symbol]
+        bb_upper = ind["bb_upper"].loc[latest, symbol]
+
+        evaluation = kc.build_evaluation_text(
+            rsi=float(rsi_val) if pd.notna(rsi_val) else None,
+            macd_hist=float(macd_hist) if pd.notna(macd_hist) else None,
+            macd_hist_prev=float(macd_hist_prev) if pd.notna(macd_hist_prev) else None,
+            close=daily_close,
+            bb_lower=float(bb_lower) if pd.notna(bb_lower) else None,
+            bb_upper=float(bb_upper) if pd.notna(bb_upper) else None,
+        )
 
     return {
         "コード": code,
         "銘柄名": name_map.get(code, ""),
-        "選定方式": method_map.get(symbol, "パターン合致"),
+        "選定方式": method,
         "現在値": round(price, 1) if price is not None else None,
         "取得時刻": price_time,
         "1単元価格": round(price * cfg.UNIT_SHARES, 0) if price is not None else None,
@@ -214,6 +259,16 @@ def _print_active_filters():
               f"RSI{cfg.DAYTRADE_RSI_MIN}〜{cfg.DAYTRADE_RSI_MAX} / "
               f"MACD上昇={cfg.DAYTRADE_REQUIRE_MACD_HIST_RISING}"
               "（単元価格・出来高のハードフィルタは上記と共通）")
+
+    value_on = getattr(cfg, "ENABLE_VALUE_FALLBACK", True)
+    print(f"  バリュー株埋め合わせ: {'ON' if value_on else 'OFF'}"
+          f"（デイトレード埋め合わせでも最大{cfg.MAX_WRITE_COUNT}件に満たない分をこの基準で補充）")
+    if value_on:
+        print(f"    条件: 時価総額<{cfg.VALUE_MAX_MARKET_CAP:,}円 / "
+              f"PER<{cfg.VALUE_MAX_PER} / PBR<{cfg.VALUE_MAX_PBR} / "
+              f"ネットキャッシュ比率(流動資産-負債)/時価総額>{cfg.VALUE_MIN_NET_CASH_RATIO}"
+              "（単元価格・出来高のハードフィルタは上記と共通、"
+              f"ファンダメンタルズ取得対象は最大{cfg.VALUE_FUNDAMENTALS_MAX_UNIVERSE}銘柄に制限）")
     print()
 
 
